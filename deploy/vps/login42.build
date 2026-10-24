@@ -1,9 +1,16 @@
-# Builds the service image from ~/projects/login42/app (the server/ source copied by deploy.sh).
+# Builds the service image from GitHub: before every build, clone main into ~/projects/login42/repo (or reset
+# an existing clone to origin/main), then build from its server/ directory. Rebuild and roll out with
+#   systemctl --user restart login42-build login42
 [Build]
 ImageTag=localhost/login42:latest
-File=%h/projects/login42/app/Containerfile
+File=%h/projects/login42/repo/server/Containerfile
 Pull=newer
+Label=org.opencontainers.image.source=https://github.com/zoeleu/login42
 
 [Service]
-WorkingDirectory=%h/projects/login42/app
+# "-": the directory only exists once the first clone has run.
+WorkingDirectory=-%h/projects/login42/repo/server
+ExecStartPre=/usr/bin/bash -c 'set -e; r=%h/projects/login42/repo; if [ -d "$$r/.git" ]; then git -C "$$r" fetch --depth 1 origin main && git -C "$$r" reset --hard origin/main; else git clone --depth 1 --branch main https://github.com/zoeleu/login42.git "$$r"; fi'
+# The commit this image was built from, for the journal.
+ExecStartPost=/usr/bin/git -C %h/projects/login42/repo log -1 "--format=login42-build: %%H %%s"
 TimeoutStartSec=900
