@@ -1,0 +1,8 @@
+# The shared backup image from ~/projects/restic-backup (the compose stacks build the same tag).
+[Build]
+ImageTag=localhost/restic-backup:latest
+File=%h/projects/restic-backup/Dockerfile
+
+[Service]
+WorkingDirectory=%h/projects/restic-backup
+TimeoutStartSec=900

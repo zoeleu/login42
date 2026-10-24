@@ -1,0 +1,22 @@
+[Unit]
+Description=login42 database backup (restic to Google Drive)
+
+[Container]
+ContainerName=login42-backup
+Image=restic-backup.build
+HostName=login42-backup
+EnvironmentFile=%h/projects/login42/backup.env
+Environment=BACKUP_SCHEDULE="45 3 * * *"
+Environment=SQLITE_DB=/data/login42.sqlite
+Environment=RESTIC_REPOSITORY=rclone:gdrive:backups/login42
+Environment=RCLONE_CONFIG=/config/rclone/rclone.conf
+Environment=TZ=America/Sao_Paulo
+Volume=login42-data.volume:/data:ro
+Volume=login42-restic-cache.volume:/root/.cache/restic
+Volume=%h/projects/restic-backup/rclone:/config/rclone
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

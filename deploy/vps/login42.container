@@ -1,0 +1,23 @@
+[Unit]
+Description=login42 web service (42 sign-in, plugin API, login audit)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=login42
+Image=login42.build
+Volume=login42-data.volume:/data
+# Loopback only: Caddy is the sole way in, which is what makes its X-Forwarded-For trustworthy.
+PublishPort=127.0.0.1:8787:8787
+EnvironmentFile=%h/projects/login42/.env
+Environment=TZ=America/Sao_Paulo
+HealthCmd=wget -q -O /dev/null http://127.0.0.1:8787/
+HealthInterval=30s
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

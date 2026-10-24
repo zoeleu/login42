@@ -1,0 +1,25 @@
+# secrets and local state
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+**/plugins/Login42/config.yml
+node_modules/
+dist/
+build/
+.gradle/
+.cloudflare/
+.wrangler/
+*.log
+/dist/
+
+# runtime databases
+*.sqlite
+*.sqlite-*
+
+# personal agent/editor state and machine-local MCP config
+.claude/
+.agents/
+.codex/
+.aws/
+.mcp.json

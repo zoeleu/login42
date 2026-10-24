@@ -1,0 +1,49 @@
+# Base URL of the Hono/Workers service (no trailing slash).
+api-url: "https://example.invalid"
+# Must equal PLUGIN_HMAC_SECRET on the web service. Keep this file out of version control.
+hmac-secret: ""
+# Per-request timeout for the web service.
+timeout-seconds: 5
+# How often the profile ban list is diffed and pushed to the web service.
+ban-poll-seconds: 10
+# Where limbo guests are sent after signing in. Empty/0 = the address and port the client connected to.
+# Requires accepts-transfers=true in server.properties (name to be verified for this Paper version).
+transfer:
+  host: ""
+  port: 0
+premium:
+  # Premium-ownership check hosted by this plugin. Players connect to a host starting with this prefix
+  # (e.g. verify.g.example.com:24242, any name that reaches this server); Mojang proves who they are and they
+  # log in automatically if already linked, or receive a one-time code for the web profile page.
+  # Other connections are untouched.
+  enabled: true
+  host-prefix: "verify."
+  # Linked Mojang UUIDs trigger real Mojang authentication on the normal address, without browser sign-in.
+  auto-login: true
+  # Explicitly use the browser/limbo path even for linked Mojang clients on hosts starting with this prefix.
+  browser-host-prefix: "offline."
+  session-url: "https://sessionserver.mojang.com/session/minecraft/hasJoined"
+  # Where /premium sends players, as host:port. Empty = "verify." + the host the player connected with.
+  verify-address: ""
+  # At join, fetch fresh textures for a linked Mojang account from this machine (falls back to the stored snapshot).
+  refresh-skin: true
+  profile-url: "https://sessionserver.mojang.com/session/minecraft/profile/"
+  # Where the verifier sends players back to, as host:port. Empty = the host they connected with, minus the prefix.
+  return-address: ""
+limbo:
+  # Caps on connections that have not signed in yet (concurrent, and per source address).
+  max-guests: 40
+  max-guests-per-ip: 3
+skins:
+  # Check web skin selection and fresh Mojang textures for online players; minimum 60 seconds.
+  poll-seconds: 60
+messages:
+  unreachable: "Login service unavailable. Try again in a minute."
+  limbo-prompt: "Sign in with your 42 account to play:"
+  busy: "Too many people are signing in. Try again shortly."
+  rate-limited: "Too many attempts. Wait a minute and try again."
+  limbo-failed: "Sign-in was rejected. Check the web page, then rejoin."
+  limbo-expired: "Link expired. Rejoin to get a new one."
+  banned: "You are banned from this server."
+  limbo-premium-hint: "Own the game? After signing in, type /premium to link your Mojang account (it gives you your skin)."
+  premium-redirect: "Connecting to Mojang verification. You will come straight back."

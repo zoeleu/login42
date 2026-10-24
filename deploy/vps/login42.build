@@ -1,0 +1,9 @@
+# Builds the service image from ~/projects/login42/app (the server/ source copied by deploy.sh).
+[Build]
+ImageTag=localhost/login42:latest
+File=%h/projects/login42/app/Containerfile
+Pull=newer
+
+[Service]
+WorkingDirectory=%h/projects/login42/app
+TimeoutStartSec=900

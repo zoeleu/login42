@@ -1,0 +1,11 @@
+name: Login42
+version: 0.2.0
+main: dev.login42.plugin.Login42Plugin
+description: Admits only linked 42 students and syncs bans to the web service.
+api-version: '26.3'
+dependencies:
+  server:
+    LuckPerms:
+      load: BEFORE
+      required: false
+      join-classpath: true
