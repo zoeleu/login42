@@ -7,10 +7,12 @@ transcripts, comments, and installed configuration can lag behind it.
 ## Scope and architecture
 
 Only eligible current 42 students may enter the game. Minecraft runs in offline mode to support
-clients without Microsoft authentication. A separate Hono service on Cloudflare Workers and D1
-owns identities, 42 OAuth, bans, transfer credentials, account links, and web profiles. The Java
-Paper plugin calls it over outbound HTTPS; the web service does not need inbound access to the
-Minecraft server. Premium verification runs **inside the plugin**, not a standalone Node service.
+clients without Microsoft authentication. A separate Hono service on **Bun with SQLite**
+(`bun:sqlite`) owns identities, 42 OAuth, bans, transfer credentials, account links, and web
+profiles. It runs on the VPS `vps-main` as Podman Quadlet units behind Caddy and Cloudflare's proxy.
+The Java Paper plugin calls it over outbound HTTPS at the public URL; the web service does not need
+inbound access to the Minecraft server, which runs on a **different host** (see deployment).
+Premium verification runs **inside the plugin**, not in the web service.
 
 | Location | Responsibility |
 | --- | --- |
@@ -22,8 +24,13 @@ Minecraft server. Premium verification runs **inside the plugin**, not a standal
 | `server/src/me.ts`, `server/src/admin.ts` | Self-service profile and deletion; authenticated administration. |
 | `server/src/lib/{audit,account}.ts` | Hash-chained login audit, retention redaction; account deletion/anonymization. |
 | `server/src/pages.ts` | Public index and privacy policy (`/privacidade` pt-BR, `/privacy` en). |
-| `server/cloudflare.config.ts` | Worker entry point, D1 binding, text variables, secret declarations, custom domain. |
-| `server/migrations/` | Ordered SQL schema changes. |
+| `server/src/server.ts` | Entry point: reads settings from the environment, refuses to start without secrets, opens the database, migrates, serves, shuts down gracefully. |
+| `server/src/lib/{db,migrate}.ts` | D1-shaped async adapter over `bun:sqlite` (transactional `batch`); migration runner. |
+| `server/src/env.d.ts` | The `Env` bindings type routes see as `c.env`. |
+| `server/migrations/` | Ordered SQL schema changes, applied at startup. |
+| `server/scripts/import-d1.ts` | One-time D1 → SQLite import used for the 2026-10-24 move (kept for reference and its test). |
+| `server/Containerfile` | Service image (`oven/bun`, non-root, database in `/data`). |
+| `deploy/vps/` | Quadlet units, `setup.sh` and `deploy.sh` for `vps-main`. |
 | `plugin/src/main/java/dev/login42/plugin/` | Startup, authenticated identity rewrite, HTTP client, limbo, guest isolation, bans, chat, skin refresh. |
 | `plugin/src/main/java/dev/login42/plugin/premium/` | Netty injection, protocol framing, RSA/AES handshake, Mojang verification, transfer back. |
 | `plugin/src/main/resources/` | Paper plugin descriptor and **default** configuration, not the live configuration. |
@@ -130,7 +137,7 @@ chose to retain the browser flow for those clients.
 
 - `login_audit` (migration 0008) records authentications for abuse investigations under legitimate
   interest: `game_login` (token consumed at join-check), `game_login_banned`, `token_reuse`,
-  `oauth_game`/`oauth_web`/`oauth_denied` (browser IP from `CF-Connecting-IP`, user agent),
+  `oauth_game`/`oauth_web`/`oauth_denied` (browser IP and user agent; see "Client IP" below),
   `premium_login`/`premium_login_denied`/`premium_proof`/`premium_link`, and `account_deleted`.
   Rows carry 42 login, canonical `mc_name`/UUID, client-claimed name/UUID (unverified), Mojang
   identity, game TCP peer IP reported by the plugin, virtual host, and the **SHA-256 of the one-use
@@ -146,21 +153,30 @@ chose to retain the browser flow for those clients.
 - Account deletion (`POST /me/delete`, `DELETE /admin/v1/users/:login`, both `lib/account.ts`)
   deletes profile/link/skin/session/token rows, anonymizes `audit_log`, and schedules that account's
   earlier `login_audit` rows (by 42 ID and the linked Mojang UUID) for redaction 183 days later in
-  `login_audit_erasure`. Redaction runs opportunistically in the join-check limbo purge batch.
+  `login_audit_erasure`. The boundary is the last audit row id at deletion time (`up_to_id`,
+  migration 0009), not a timestamp: a login in the same millisecond as the deletion must not be
+  swept in. Redaction runs opportunistically in the join-check limbo purge batch.
   Banned accounts cannot be deleted. Game-server data (world, LuckPerms, CoreProtect, server logs)
   is not touched by the web service.
+- **Client IP.** Game IPs are the TCP peer the plugin reports. Browser IPs come from
+  `X-Forwarded-For`, which Caddy overwrites with the client address it accepted from Cloudflare's
+  ranges (`trusted_proxies`, `header_up X-Forwarded-For {client_ip}`). The service is published on
+  loopback only, so Caddy is the sole way in. `CF-Connecting-IP` is deliberately ignored: a request
+  sent straight to the VPS could forge it. A comma-separated value fails `cleanIp` and is stored as null.
 - The privacy policy states retention promises; keep `/privacidade` and `/privacy` consistent with
   the code. `PRIVACY_CONTACT` (currently `42craft@zoe.dev.br`) is the published LGPD contact.
   The 6-month erasure applies only to `login_audit`; game-server logs and CoreProtect data are kept
   while needed for moderation and operation, as the policy states.
 - Signed textures are required. Uploaded PNGs are validated and signed through MineSkin as
   **unlisted**; do not silently change visibility or assume paid private uploads are available.
-- Mojang profile requests from Cloudflare Workers have returned HTTP 403. The game server fetches
-  fresh signed premium textures, caches briefly, and falls back to the verified stored snapshot.
+- Mojang profile requests from Cloudflare Workers returned HTTP 403 (the service has since moved;
+  the fallback stays). The game server fetches fresh signed premium textures, caches briefly, and
+  falls back to the verified stored snapshot. The service's own lookup has a 3-second timeout
+  because it runs inside join-check.
   Do not regress to requiring `/premium` every time a player changes their Mojang skin.
 - `SkinSync` polls the HMAC-protected `POST /api/v1/skins` endpoint for signed-in online UUIDs in
   batches of at most 100. It reads current upload/default/Mojang selection without external calls
-  from the Worker, then fetches Mojang textures asynchronously on the game server. Polling defaults
+  from the service, then fetches Mojang textures asynchronously on the game server. Polling defaults
   to 60 seconds (`skins.poll-seconds`, minimum 60); shared Mojang success cache lasts 60 seconds.
   Visible updates normally take 1–2 minutes plus any Mojang propagation delay.
 - Apply online changes with Paper's `Player.setPlayerProfile` on the main thread, preserving the
@@ -174,20 +190,23 @@ chose to retain the browser flow for those clients.
 - Plugin: Java 25 toolchain, installed Gradle (no wrapper), Paper API
   `26.3.build.214-stable`, Netty `4.2.16.Final`, LuckPerms API `5.4`, JUnit 5.
   Output: `plugin/build/libs/login42.jar`.
-- Service: Node 24 has been used successfully; the tests need a Node runtime with `node:sqlite`.
-  TypeScript, Hono, Vite, and Cloudflare's **`cf` CLI**, not a Wrangler configuration. Use the
-  checked-in lockfile; do not replace this setup casually with a different development server.
-- Install service dependencies with `npm ci` in `server/`. If absent, copy `.dev.vars.example`
-  to `.dev.vars` and configure local secrets without overwriting existing values.
-- `npm run dev` in `server/` starts `cf dev` at `http://127.0.0.1:5173`.
-- `npm run build` builds the Worker. `npm run typecheck` generates Worker types and runs TypeScript;
-  `./node_modules/.bin/tsc --noEmit` checks when generated types already exist.
+- Service: **Bun 1.4.4** (`bun:sqlite`, `Bun.serve`, `bun test`), TypeScript, Hono. No bundling or
+  build step: the image runs `bun src/server.ts`. Use the checked-in `bun.lock`.
+- Install service dependencies with `bun install` in `server/`. For local runs copy `.env.example`
+  to `.env` and fill in local secrets without overwriting existing values. Bun loads `.env` itself.
+- `bun run dev` in `server/` serves `http://127.0.0.1:8787` with a local `login42.sqlite`
+  (git-ignored), applying migrations on start.
+- `bun run typecheck` runs `tsc --noEmit`. Outside requests (42, Mojang, MineSkin) all carry
+  `AbortSignal.timeout`; keep it that way, because join-check waits on some of them.
 - `gradle test build` in `plugin/` tests and builds the plugin.
 
 ### Database migrations
 
-Apply numbered SQL files in order. For existing databases, inspect migration history/schema and
-apply **only missing migrations**; these files are not generally safe to replay.
+`src/lib/migrate.ts` applies `migrations/*.sql` in order at startup, each file in one transaction,
+and records it in `schema_migrations`. A recorded file is never run again: these files are not
+generally safe to replay. A new migration therefore reaches production simply by deploying, so it
+must be correct against the live database on the first try. Add a new numbered file rather than
+editing an applied one.
 
 | Migration | Purpose |
 | --- | --- |
@@ -199,33 +218,30 @@ apply **only missing migrations**; these files are not generally safe to replay.
 | `0006_special_title.sql` | Selected Intra title on users. |
 | `0007_premium_accounts.sql` | Independent Mojang ownership links; backfill existing verified skins. |
 | `0008_login_audit.sql` | Hash-chained, append-only login audit; erasure schedule for deleted accounts. |
+| `0009_erasure_boundary.sql` | Erasure covers audit rows up to an id (`up_to_id`) instead of a timestamp. |
 
-The local D1 used by `cf dev` is not necessarily the database state written by
-`cf d1 migrations apply ... --local`. Use the running dev explorer:
-
-1. `GET /cdn-cgi/local/explorer/api/d1/database` to discover its actual UUID.
-2. `POST /cdn-cgi/local/explorer/api/d1/database/<uuid>/raw` with JSON
-   `{"batch":[{"sql":"<migration SQL>"}]}` for the missing migrations.
-3. Restart the dev server if necessary and verify the schema in that same database.
-
-For production, migrate the actual D1 binding before deploying code that references new columns
-or tables. Preserve existing identities, account links, bans, and player data. Do not run the local
-integration suite or its cleanup SQL against production.
+Production data moved from D1 on 2026-10-24: with the game stopped, every table was dumped with
+`cf d1 query`, and `scripts/import-d1.ts` loaded it into a new database in one transaction. The import
+committed only after row counts matched and the audit chain verified to the head D1 reported
+(`#8 b651be6a…`); it also marks 0001–0008 as applied. Do not run tests or their SQL against the
+production database.
 
 ## Verification
 
-From `server/`, run `./node_modules/.bin/vitest run` and TypeScript checking. The integration suite
-requires a configured `.dev.vars` **even at import time**, and a running, migrated local `cf dev`.
-It skips integration tests if the dev server is absent; report skipped tests instead of calling
-that a full pass. `premium-login.test.ts` uses the real schema in in-memory SQLite and mocks only
-the external 42 API. Keep fallback tests deterministic rather than waiting for live Mojang failure.
+From `server/`, run `bun test` and `bun run typecheck`. Nothing is skipped: the integration suite
+starts the real `Bun.serve` on a free port against a temporary database file with random secrets.
+`premium-login.test.ts` uses the real schema and adapter on in-memory SQLite and mocks only the
+external 42 API (`globalThis.fetch`). `runtime.test.ts` covers the adapter (transactional batch,
+foreign keys), migrations and startup checks; `import-d1.test.ts` round-trips a D1-format dump.
+Keep Mojang paths deterministic (prefill `mojang_cache` or record a recent failure) instead of
+calling Mojang. Bun quirk: after `toMatchObject` with asymmetric matchers, read values you need
+later into locals first.
 
 From `plugin/`, run `gradle test build`. Tests include HMAC compatibility, ban reconciliation,
 chat components, texture refresh, and a fake Minecraft client exercising RSA/AES, cookie handling,
 normal-address premium login, spoofed hints, fragmented packets, and transfer-loop prevention.
-Last full checks on 2026-10-24 passed **59 service tests (including 19 integration) and 39 plugin
-tests**; these are historical
-counts, not a substitute for running relevant checks after code changes.
+Last full checks on 2026-10-24 passed **68 service tests and 39 plugin tests**; these are
+historical counts, not a substitute for running relevant checks after code changes.
 
 For authentication/protocol changes, also verify with a real client when available:
 
@@ -241,6 +257,10 @@ Normal-address automatic premium login was observed on production after the last
 canonical UUID, and entry into the overworld without a limbo login. Title component behavior is
 covered by tests; no live visual hover screenshot was captured for a titled account.
 
+After the move to `vps-main` (2026-10-24), a real premium reconnect produced `premium_login` and
+`game_login` records sharing one token hash, with the IP Paper logged, and the game log's
+`Login audit #<id> <hash>` lines matched the stored hashes.
+
 ## Configuration and deployment
 
 Required server properties: `online-mode=false`, `accepts-transfers=true`, `white-list=false`.
@@ -252,30 +272,59 @@ Install OfflineEncryptor separately for offline-mode protocol encryption; it is 
 not be bundled into Login42. It protects against passive sniffing, not active on-path interception.
 Install LuckPerms separately for chat preferences and preserve `plugins/LuckPerms/` in backups.
 
-Worker secrets: `FT_CLIENT_ID`, `FT_CLIENT_SECRET`, `PLUGIN_HMAC_SECRET`, `ADMIN_TOKEN`,
-`MINESKIN_API_KEY` (optional for uploads). Text settings live in `server/cloudflare.config.ts`:
-`PUBLIC_URL`, `TOKEN_TTL_SECONDS`, `ALLOW_STAFF`, `LIMBO_PER_MINUTE`, `VERIFIER_ADDRESS`, `PRIVACY_CONTACT`.
-Register `<PUBLIC_URL>/auth/callback` in the 42 OAuth application.
+Service settings come from the environment (`server/.env.example`; production template
+`deploy/vps/.env.example`). Required, or the service refuses to start: `PUBLIC_URL`,
+`FT_CLIENT_ID`, `FT_CLIENT_SECRET`, `PLUGIN_HMAC_SECRET`, `ADMIN_TOKEN`. Optional with defaults:
+`MINESKIN_API_KEY` (uploads), `VERIFIER_ADDRESS`, `LIMBO_PER_MINUTE`, `TOKEN_TTL_SECONDS`,
+`ALLOW_STAFF`, `PRIVACY_CONTACT`. `HOST`, `PORT` and `DB_PATH` come from the image; do not set them
+in the production `.env`. Register `<PUBLIC_URL>/auth/callback` in the 42 OAuth application.
 
 The live `plugins/Login42/config.yml` is independent of the bundled defaults. Preserve it when
 uploading a jar: `saveDefaultConfig()` does not merge new settings into existing configurations.
-The HMAC secret must match the Worker. Check premium routing explicitly instead of relying on
+The HMAC secret must match the service's `PLUGIN_HMAC_SECRET`. Check premium routing explicitly instead of relying on
 derived hostnames.
 
 ### Existing deployment (verify live state before operating)
 
-- Web/profile: `https://42craft.zoe.dev.br`; Worker `login42`, D1 `42login`.
-  D1 ID: `6c0a683e-70da-4aa8-b53b-b0790fa884bd`.
+- Web/profile: `https://42craft.zoe.dev.br`, a Cloudflare-proxied A record to `vps-main` (Ubuntu,
+  aarch64, rootless Podman). Caddy (system service, `~/projects/caddy/Caddyfile`, installed with
+  `sudo ./setup.sh`) terminates TLS and proxies to `127.0.0.1:8787`.
+- Units live in `~/projects/login42/` (copied from `deploy/vps/`, linked into
+  `~/.config/containers/systemd/` by `setup.sh`):
+  `login42.build` → `login42-build.service`, `login42.container` → `login42.service`,
+  `login42-data.volume` (database at `/data/login42.sqlite`), `login42-backup.container` +
+  `restic-backup.build` + `login42-restic-cache.volume`. Services start on boot.
+- **Builds come from GitHub.** `login42-build.service` clones or resets
+  `~/projects/login42/repo` to `origin/main` of `https://github.com/zoeleu/login42`, builds
+  `server/`, and logs `login42-build: <commit> <subject>` in its journal. To deploy: push to `main`,
+  then run `deploy/vps/deploy.sh` (copies the units and restarts), or on the VPS
+  `systemctl --user restart login42-build login42`. The VPS builds what is on GitHub, not your
+  checkout, and migrations run when the new image starts.
+- Secrets: `~/projects/login42/.env` and `backup.env` (restic password), both mode 600, not in
+  Git. The local `~/.config/login42/prod.env` holds the same five secrets. Restoring backups needs
+  that restic password, so keep a copy off the VPS.
+- Operations: `systemctl --user status login42`, `journalctl --user -u login42` (and
+  `-u login42-build`). The admin API from the VPS: `curl -H "Authorization: Bearer $T"
+  http://127.0.0.1:8787/admin/v1/...` with the token read from `.env`; never print it.
+- Backups: nightly at 03:45 (America/Sao_Paulo) to `rclone:gdrive:backups/login42`, an online
+  `sqlite3 .backup` snapshot plus `restic check`. Run one by hand with
+  `podman exec login42-backup /usr/local/bin/backup.sh`.
+- `/data/pre-cutover/` in the volume holds the empty database that was used for smoke tests before the
+  move; it can be deleted.
+- Legacy: Worker `login42` and D1 `42login` (`6c0a683e-70da-4aa8-b53b-b0790fa884bd`) still exist
+  but receive no traffic; the custom domain was detached on 2026-10-24 and D1 is frozen at audit
+  head `#8`. Rolling back would mean re-attaching the domain and losing everything written on the
+  VPS since. Decommission them once the VPS has run for a while.
 - Game: Pelican server `42craft`, short ID `c754b94b`; Purpur 26.3. LuckPerms 5.5.88 was installed.
+  It runs on the game host behind `*.g.zoe.dev.br`, **not** on `vps-main` (the panel at
+  `pelican.zoe.dev.br` and a Wings node do run on `vps-main`).
 - Minecraft DNS: `_minecraft._tcp.42craft.zoe.dev.br` SRV `0 5 24242 42.g.zoe.dev.br`.
-  `*.g.zoe.dev.br` resolves to the game host. The public `42craft` hostname serves the Worker too.
+  `*.g.zoe.dev.br` resolves to the game host (DNS only). The public `42craft` hostname is the web
+  service on `vps-main` (proxied); players use it in Minecraft too, through the SRV record.
 - Live verifier settings: `premium.verify-address: "verify.g.zoe.dev.br:24242"` and
   `premium.return-address: "42.g.zoe.dev.br:24242"`.
   **`verify.42craft.zoe.dev.br` is not covered by the game wildcard.** This caused failed `/premium`
   transfers before explicit routing was configured.
-- Local production secrets file: `~/.config/login42/prod.env`, mode 600, outside the repository.
-  When deployment is in scope: from `server/`, run
-  `./node_modules/.bin/cf deploy --secrets-file ~/.config/login42/prod.env`.
 - Upload the binary `plugin/build/libs/login42.jar` to `/plugins/login42.jar`; do not leave another
   loadable copy in the top-level plugins directory. `dist/` contains ignored distribution copies
   and may include an older fallback jar; always build from source for a new deployment.
@@ -284,10 +333,10 @@ derived hostnames.
   Keep rollback copies outside plugin discovery paths. Do not replace live config or secret files.
 
 For local/documentation tasks, no production mutation or restart is needed. For authorized live
-work, prefer the connected Pelican, Cloudflare, and mcpfabric tools. Pelican's current MCP file
-writer handles text, not jars: use its binary upload API or the panel/SFTP when necessary. Never
-pass binary jar contents through the text writer. Cloudflare D1 operations should target the
-configured database, not a similarly named local instance.
+work, prefer SSH to `vps-main` for the web service and the connected Pelican, Cloudflare and
+mcpfabric tools otherwise. Pelican's current MCP file writer handles text, not jars: use its binary
+upload API or the panel/SFTP when necessary. Never pass binary jar contents through the text
+writer. The `cf` CLI cannot manage Worker custom domains; the Cloudflare MCP server's API access can.
 
 The game bridge is client-side mcpfabric. Call `get_status` first, then use `get_screen`/`join_world`
 for connection state. `join_world` is only valid from menus; the user may already have rejoined.
@@ -305,12 +354,15 @@ Clean up only the local dev processes/browser tabs started for your task; leave 
   default, and are single-use. Replaying a consumed token revokes that user's tokens. Browser
   sessions use HttpOnly cookies and CSRF checks; preserve those checks for profile mutations.
 - Never print, commit, embed in docs, or paste secrets into visible commands/tool arguments.
-  `.dev.vars`, production environment files, live plugin configs, and MCP launchers can contain
+  `.env` files, `server/.dev.vars` (left over from the Workers setup), production environment
+  files, live plugin configs, and MCP launchers can contain
   credentials. Redact before displaying configuration/API results; use existing configured secret
   sources rather than copying historical transcript values. Rotation is a separate operation
   requiring all relevant services to be updated consistently.
-- Read `.gitignore` before adding artifacts. Do not commit dependencies, build output, local
-  Cloudflare state, credential files, or runtime databases. Inspect actual Git availability before
+- **The repository is public.** Read `.gitignore` before adding artifacts. Do not commit
+  dependencies, build output, credential files, runtime databases, personal agent config, real
+  players' logins/titles/IPs, or production log excerpts; tests use fictional logins (`jdoe`) and
+  documentation address ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32). Inspect actual Git availability before
   assuming repository status/history is accessible in a sandboxed checkout.
 - Use parameterized SQL, preserve foreign-key cleanup and unlink semantics, and add numbered
   migrations instead of rewriting applied history. Test account conflicts and auth races.
